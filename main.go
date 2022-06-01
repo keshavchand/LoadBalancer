@@ -5,32 +5,54 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"time"
 )
 
 // TODO: Health check
-func CreateProxy(site string) *httputil.ReverseProxy {
+func CreateProxy(site string) (ReverseProxy, error) {
+	var rp ReverseProxy
 	url, err := url.Parse(site)
 	if err != nil {
-		log.Println(err)
-		return nil
+		return rp, err
 	}
-	return httputil.NewSingleHostReverseProxy(url)
+	rp.proxy = httputil.NewSingleHostReverseProxy(url)
+	rp.url = url
+	rp.valid = true
+	return rp, nil
 }
 
 type loadBalancer struct {
-	servers []*httputil.ReverseProxy
+	sync.RWMutex
+	servers []ReverseProxy
 	last    int
 }
 
+type ReverseProxy struct {
+	proxy *httputil.ReverseProxy
+	url   *url.URL
+	valid bool
+}
+
 func main() {
-	lb := loadBalancer{
-		servers: []*httputil.ReverseProxy{
-			CreateProxy("http://localhost:8001"),
-			CreateProxy("http://localhost:8002"),
-			CreateProxy("http://localhost:8003"),
-		},
+	backends := []string{
+		"http://localhost:8001",
+		"http://localhost:8002",
+		"http://localhost:8003",
+		"http://localhost:8004",
+		"http://localhost:8005",
 	}
+
+	lb := loadBalancer{}
+	for _, s := range backends {
+		rp, err := CreateProxy(s)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+		lb.servers = append(lb.servers, rp)
+	}
+	lb.SetHealthCheck()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", lb.HandleLoadBalaner)
@@ -46,7 +68,42 @@ func main() {
 }
 
 func (lb *loadBalancer) HandleLoadBalaner(w http.ResponseWriter, r *http.Request) {
-	lb.last++
-	lb.last %= len(lb.servers)
-	lb.servers[lb.last].ServeHTTP(w, r)
+	server := lb.GetValidServer()
+	if server == nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	server.ServeHTTP(w, r)
+}
+
+func (lb *loadBalancer) GetValidServer() *httputil.ReverseProxy {
+	lb.RLock()
+	defer lb.RUnlock()
+	for i := 0; i < len(lb.servers); i++ {
+		lb.last++
+		lb.last %= len(lb.servers)
+		if lb.servers[lb.last].valid {
+			log.Println("returning", lb.servers[lb.last].url.Host)
+			return lb.servers[lb.last].proxy
+		}
+	}
+	log.Println("no valid server to return")
+	return nil
+}
+
+func (lb *loadBalancer) ErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
+	lb.Lock()
+	defer lb.Unlock()
+	log.Println(r.URL.Host, ":", err)
+	for i := 0; i < len(lb.servers); i++ {
+		if lb.servers[i].url.Host == r.URL.Host {
+			lb.servers[i].valid = false
+		}
+	}
+}
+
+func (lb *loadBalancer) SetHealthCheck() {
+	for i := 0; i < len(lb.servers); i++ {
+		lb.servers[i].proxy.ErrorHandler = lb.ErrorHandler
+	}
 }
